@@ -34,6 +34,7 @@ class ModelWrapper:
         self.use_vllm = use_vllm and _HAS_VLLM
         self.vllm_engine = None
         self.latent_space_realign = bool(getattr(args, "latent_space_realign", False)) if args else False
+        # 存储不同模型的重新对齐矩阵
         self._latent_realign_matrices: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self.args = args
 
@@ -41,28 +42,40 @@ class ModelWrapper:
         self.pre_aligned = None
 
         if self.use_vllm:
-            
+            # tensor并行大小，至少为1
             tp_size = max(1, int(getattr(args, "tensor_parallel_size", 1)))
+            # gpu利用率
             gpu_util = float(getattr(args, "gpu_memory_utilization", 0.9))
-            
+
             print(f"[vLLM] Using vLLM backend for model {model_name}")
             if args.enable_prefix_caching and args.method == "latent_mas": 
                 self.vllm_engine = LLM(model=model_name, tensor_parallel_size=tp_size, gpu_memory_utilization=gpu_util, enable_prefix_caching=True, enable_prompt_embeds=True)
             else:
                 self.vllm_engine = LLM(model=model_name, tensor_parallel_size=tp_size, gpu_memory_utilization=gpu_util)
+            """
+              加载分词器对象：根据模型名称自动识别应该使用哪种分词器
+            - 下载配置 ：如果模型在本地不存在，会从 Hugging Face Hub 下载相应的分词器配置文件
+            - 初始化分词器 ：创建一个可用的分词器对象
+            - 性能优化 ：使用快速分词器提高处理速度
+            """
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-            
+
             use_second_hf = bool(getattr(args, "use_second_HF_model", False)) if args else False
+            # 第二个HF模型
             if use_second_hf:
+                ## 从预训练模型加载因果语言模型
                 self.HF_model = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
-                ).to(args.device2).eval() 
+                ).to(args.device2).eval() # eval将模型设置为评估模式，禁用dropout和batch normalization训练模式
+                # 获取模型的输入嵌入层，这是一个将token ID转换为向量的线性层
                 self.embedding_layer = self.HF_model.get_input_embeddings()
                 self.HF_device = args.device2
                 # if self.latent_space_realign:
                 self._ensure_latent_realign_matrix(self.HF_model, torch.device(self.HF_device), args)
             elif self.latent_space_realign:
+                # 提示在使用vLLM后端时，如果要启用潜在空间重对齐功能，必须同时指定 --use_second_HF_model 参数
+                # vLLM后端本身不支持潜在空间操作，需要额外的HF模型来处理这些操作
                 raise ValueError("latent_space_realign requires --use_second_HF_model when using vLLM backend.")
             _ensure_pad_token(self.tokenizer)
             return  # skip loading transformers model
@@ -70,20 +83,27 @@ class ModelWrapper:
         # fallback: normal transformers path
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
         _ensure_pad_token(self.tokenizer)
+        # 上下文管理器，禁用梯度计算
+        # 目的 ：在加载模型时不需要计算梯度，可以节省内存和计算资源
+        # 效果 ：在此代码块内的所有操作都不会被记录在计算图中
         with torch.no_grad():
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 torch_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
             )
+        # 作用 ：检查分词器词汇表大小与模型嵌入层是否匹配
         if len(self.tokenizer) != self.model.get_input_embeddings().weight.shape[0]:
+            # 作用 ：调整模型的token嵌入层大小以匹配分词器
             self.model.resize_token_embeddings(len(self.tokenizer))
         self.model.to(device)
         self.model.eval()
         if hasattr(self.model.config, "use_cache"):
+            # 启用kv缓存
             self.model.config.use_cache = True
         if self.latent_space_realign:
             self._ensure_latent_realign_matrix(self.model, self.device, args)
 
+    # 将结构化的chat message转换为模型可直接处理的张量格式
     def render_chat(self, messages: List[Dict], add_generation_prompt: bool = True) -> str:
         tpl = getattr(self.tokenizer, "chat_template", None)
         if tpl:
@@ -99,13 +119,19 @@ class ModelWrapper:
             segments.append("<|assistant|>")
         return "\n".join(segments)
 
+    # 返回类型 ： Tuple[str, torch.Tensor, torch.Tensor, List[str]]
+    # - 四元组内容 ：
+    # 1. str : 渲染后的提示文本
+    # 2. torch.Tensor : 输入ID张量（形状： [1, sequence_length] ）
+    # 3. torch.Tensor : 注意力掩码张量（形状： [1, sequence_length] ）
+    # 4. List[str] : 活跃token对应的字符串列表
     def prepare_chat_input(
         self, messages: List[Dict], add_generation_prompt: bool = True
     ) -> Tuple[str, torch.Tensor, torch.Tensor, List[str]]:
         prompt_text = self.render_chat(messages, add_generation_prompt=add_generation_prompt)
         encoded = self.tokenizer(
             prompt_text,
-            return_tensors="pt",
+            return_tensors="pt", #pythorch 张量格式
             add_special_tokens=False,
         )
         input_ids = encoded["input_ids"].to(self.device)
@@ -154,7 +180,7 @@ class ModelWrapper:
         outputs = self.vllm_engine.generate(prompts, sampling_params)
         generations = [out.outputs[0].text.strip() for out in outputs]
         return generations
-    
+
     def _build_latent_realign_matrix(self, model, device, args) -> Tuple[torch.Tensor, torch.Tensor]:
         input_embeds = model.get_input_embeddings() if hasattr(model, "get_input_embeddings") else None
         output_embeds = model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
@@ -327,7 +353,7 @@ class ModelWrapper:
 
             if step == 0:
                 e_t_plus_1 = latent_vec.detach().clone()
-            
+
             latent_embed = latent_vec.unsqueeze(1)
 
             past_len = _past_length(past)
@@ -348,7 +374,7 @@ class ModelWrapper:
             last_hidden = outputs.hidden_states[-1][:, -1, :]
 
         return past
-    
+
     @torch.no_grad()
     def generate_latent_batch_hidden_state(
         self,
@@ -383,11 +409,10 @@ class ModelWrapper:
         )
         past = outputs.past_key_values
         last_hidden = outputs.hidden_states[-1][:, -1, :]
-        
+
         curr_output_embedding = [] 
         curr_output_embedding.append(outputs.hidden_states[0])  # input embedding
-        
-        
+
         for _ in range(latent_steps):
 
             source_model = self.HF_model if hasattr(self, "HF_model") else self.model
@@ -413,4 +438,3 @@ class ModelWrapper:
             curr_output_embedding.append(latent_embed.detach())
 
         return past, torch.cat(curr_output_embedding, dim=1) # Output input embeddings
-

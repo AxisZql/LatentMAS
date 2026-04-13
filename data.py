@@ -8,8 +8,10 @@ from utils import extract_gold, normalize_answer
 def load_gsm8k(split: str = "test", cache_dir: Optional[str] = None) -> Iterable[Dict]:
     ds = load_dataset("gsm8k", "main", split=split, cache_dir=cache_dir)
     for item in ds:
+        # .strip 去除问题文本首尾的空白字符
         question = item["question"].strip()
         solution = item["answer"]
+        # 从解决方案中提取出正确答案
         gold = normalize_answer(extract_gold(solution))
         yield {
             "question": question,

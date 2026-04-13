@@ -37,6 +37,15 @@ def extract_gsm8k_answer(text: str) -> Optional[str]:
 
 
 def extract_gold(text: str) -> Optional[str]:
+    '''
+    model_output = """
+    解题过程...
+    所以答案是 #### 42
+    """
+    提取42
+    \s*表示0至多个空格,制表符等
+    [-+]?可选正负号，\d+一个或多个数字，(?:\.\d+)?可选小数
+    '''
     match = re.search(r"####\s*([-+]?\d+(?:\.\d+)?)", text)
     return match.group(1) if match else None
 
@@ -78,4 +87,3 @@ def run_with_timeout(code, timeout):
             ns['ok'] = False
             ns['error'] = f"TimeoutError: Execution exceeded {timeout} seconds"
         return ns.get('ok', False), ns.get('error', None)
-

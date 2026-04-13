@@ -122,8 +122,11 @@ def main():
         args.use_second_HF_model = True 
         args.enable_prefix_caching = True
     
+    # 设置随机种子，确保实验可重复
     set_seed(args.seed)
+    # 自动选择 如CPU or CUDA
     device = auto_device(args.device)
+    # 初始化模型包装器
     model = ModelWrapper(args.model_name, device, use_vllm=args.use_vllm, args=args)
     
     start_time = time.time()
